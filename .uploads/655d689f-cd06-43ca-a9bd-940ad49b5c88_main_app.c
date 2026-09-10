@@ -1043,15 +1043,15 @@ __attribute__((weak)) int rk_ui_osd_commit(const void *canvas, uint32_t width,
  *   1: yolov5, 3 个分支输出(原始输出, 需要用 anchors 解码)
  *   2: yolov5, 单个已解码输出([1,N,5+nc], obj/cls 需 sigmoid)
  *   3: yolov8, 单个输出([1,4+nc,N], 分数已解码, 无需 sigmoid)
- *   4: 解耦头, 每个尺度层多个输出(reg DFL 64ch + cls nc ch [+ obj 1ch]), NCHW,
- *      cls/obj 已是 sigmoid 概率(勿再 sigmoid), reg 为 DFL 原始分布
+ *   4: 解耦头, 每个尺度层多个输出(reg DFL 64ch + cls nc ch [+ sum 1ch]), NCHW,
+ *      cls/sum 已是 sigmoid 概率(勿再 sigmoid), reg 为 DFL 原始分布
  * 模型输出不匹配时按 rknn_dump_output_attrs() 打印的 dims 调整。 */
 #define CVR_RKNN_POSTPROC        0
 #define DET_MAX_BOXES            32
 #define DET_CONF_THRESHOLD       0.25f
 #define DET_NMS_THRESHOLD        0.45f
 #define DFL_BINS                 16     /* 解耦头 DFL 回归 bins (4 边 x 16 = 64ch) */
-#define DECOUPLED_USE_OBJ        1     /* 解耦头 1ch 输出按 objectness 参与 conf; 无此分支置 0 */
+#define DECOUPLED_USE_OBJ        1     /* 解耦头 1ch 为 score_sum(各类概率和), 仅做格子预筛; 无此分支置 0 */
 
 typedef struct {
 	float x1, y1, x2, y2; /* 模型输入像素坐标 */
@@ -1410,12 +1410,13 @@ static int yolo_single_decode(const float *data, const rknn_tensor_attr *attr,
 	return box_cnt;
 }
 
-/* ---------------- 解耦头后处理 (9 输出: 每层 reg DFL 64ch + cls nc ch + obj 1ch) -----
+/* ---------------- 解耦头后处理 (9 输出: 每层 reg DFL 64ch + cls nc ch + sum 1ch) -----
  * 输出按空间尺寸成组(80x80/40x40/20x20, 对应 stride 8/16/32), 每组 NCHW:
  *   reg: 1x64xHxW, DFL 分布(4 边 x 16 bins), softmax 取期望得到格子为单位的 l/t/r/b
  *   cls: 1xncxHxW, 类别概率(量化 zp=-128, 值域[0,0.77], 模型已做 sigmoid, 勿再 sigmoid)
- *   obj: 1x1xHxW,  objectness 概率(同上, 已做 sigmoid)
+ *   sum: 1x1xHxW,  score_sum(各类概率之和, RKOPT 导出的加速分支), 仅做格子预筛
  * 注意: 若再叠加 sigmoid, 背景原始分~0.09 会被抬到 0.28 左右过阈值, 产生满屏噪声框
+ * conf = max_cls(与官方 postprocess.cc 一致); 勿乘 score_sum, 否则中等置信度框被压掉
  * anchor 在格子中心: x1=(col+0.5-l)*stride ... (yolov6/v8 风格)
  * ------------------------------------------------------------------------- */
 
@@ -1510,6 +1511,9 @@ static int yolo_decoupled_decode(const rknn_output *outputs, uint32_t n_out,
 				float best = 0.0f;
 				int best_cls = 0;
 
+				/* score_sum 预筛(官方 postprocess.cc 语义): 分数和低于阈值整格跳过 */
+				if (obj && obj[off] <= DET_CONF_THRESHOLD)
+					continue;
 				for (k = 0; k < nc; k++) {
 					/* cls 输出已是 sigmoid 概率(量化 zp=-128, 值域[0,0.77]), 直接用 */
 					float score = cls[(size_t)k * plane + off];
@@ -1519,8 +1523,7 @@ static int yolo_decoupled_decode(const rknn_output *outputs, uint32_t n_out,
 						best_cls = (int)k;
 					}
 				}
-				if (obj)
-					best *= obj[off]; /* obj 同为概率输出, 勿再 sigmoid */
+				/* conf = max_cls; 勿乘 score_sum(它是各类分之和, 相乘会压掉中等置信度框) */
 				if (best <= DET_CONF_THRESHOLD)
 					continue;
 				{

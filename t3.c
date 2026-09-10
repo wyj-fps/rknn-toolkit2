@@ -108,14 +108,14 @@ static void rknn_dump_output_attrs(void) {
  *   1: yolov5, 3 个分支输出(原始输出, 需要用 anchors 解码)
  *   2: yolov5, 单个已解码输出([1,N,5+nc], obj/cls 需 sigmoid)
  *   3: yolov8, 单个输出([1,4+nc,N], 分数已解码, 无需 sigmoid)
- *   4: 解耦头, 每个尺度层多个输出(reg DFL 64ch + cls nc ch [+ obj 1ch]), NCHW
+ *   4: 解耦头, 每个尺度层多个输出(reg DFL 64ch + cls nc ch [+ sum 1ch]), NCHW
  * 模型输出不匹配时按 rknn_dump_output_attrs() 打印的 dims 调整。 */
 #define CVR_RKNN_POSTPROC        0
 #define DET_MAX_BOXES            32
 #define DET_CONF_THRESHOLD       0.25f
 #define DET_NMS_THRESHOLD        0.45f
 #define DFL_BINS                 16     /* 解耦头 DFL 回归 bins (4 边 x 16 = 64ch) */
-#define DECOUPLED_USE_OBJ        1     /* 解耦头 1ch 输出按 objectness 参与 conf; 无此分支置 0 */
+#define DECOUPLED_USE_OBJ        1     /* 解耦头 1ch 为 score_sum(各类概率和), 仅做格子预筛; 无此分支置 0 */
 
 typedef struct {
 	float x1, y1, x2, y2; /* 模型输入像素坐标 */
@@ -474,11 +474,12 @@ static int yolo_single_decode(const float *data, const rknn_tensor_attr *attr,
 	return box_cnt;
 }
 
-/* ---------------- 解耦头后处理 (9 输出: 每层 reg DFL 64ch + cls nc ch + obj 1ch) -----
+/* ---------------- 解耦头后处理 (9 输出: 每层 reg DFL 64ch + cls nc ch + sum 1ch) -----
  * 输出按空间尺寸成组(80x80/40x40/20x20, 对应 stride 8/16/32), 每组 NCHW:
  *   reg: 1x64xHxW, DFL 分布(4 边 x 16 bins), softmax 取期望得到格子为单位的 l/t/r/b
- *   cls: 1xncxHxW, 类别 logit(需 sigmoid)
- *   obj: 1x1xHxW,  objectness logit(需 sigmoid, 可选)
+ *   cls: 1xncxHxW, 类别概率(量化 zp=-128, 模型已做 sigmoid, 勿再 sigmoid)
+ *   sum: 1x1xHxW,  score_sum(各类概率之和, RKOPT 导出的加速分支), 仅做格子预筛
+ * conf = max_cls(与官方 postprocess.cc 一致); 勿乘 score_sum, 否则中等置信度框被压掉
  * anchor 在格子中心: x1=(col+0.5-l)*stride ... (yolov6/v8 风格)
  * ------------------------------------------------------------------------- */
 
@@ -573,6 +574,9 @@ static int yolo_decoupled_decode(const rknn_output *outputs, uint32_t n_out,
 				float best = 0.0f;
 				int best_cls = 0;
 
+				/* score_sum 预筛(官方 postprocess.cc 语义): 分数和低于阈值整格跳过 */
+				if (obj && obj[off] <= DET_CONF_THRESHOLD)
+					continue;
 				for (k = 0; k < nc; k++) {
 					/* cls 输出已是 sigmoid 概率(量化 zp=-128, 值域[0,0.77]), 直接用 */
 					float score = cls[(size_t)k * plane + off];
@@ -582,8 +586,7 @@ static int yolo_decoupled_decode(const rknn_output *outputs, uint32_t n_out,
 						best_cls = (int)k;
 					}
 				}
-				if (obj)
-					best *= obj[off]; /* obj 同为概率输出, 勿再 sigmoid */
+				/* conf = max_cls; 勿乘 score_sum(它是各类分之和, 相乘会压掉中等置信度框) */
 				if (best <= DET_CONF_THRESHOLD)
 					continue;
 				{
@@ -939,7 +942,7 @@ int main(void) {
         fails += check(!rknn_is_decoupled_head(3), "decoupled: 3-out rejected");
         fails += check(!rknn_is_decoupled_head(1), "decoupled: 1-out rejected");
 
-        /* level0(80x80, s=8) cell(10,10): l=2,t=1,r=3,b=4; cls=5 概率; obj 概率 */
+        /* level0(80x80, s=8) cell(10,10): l=2,t=1,r=3,b=4; cls=5 概率; score_sum */
         {
             float *reg = bufs[0], *cls = bufs[1], *obj = bufs[2];
             size_t plane = 6400, off = 10 * 80 + 10;
@@ -951,7 +954,7 @@ int main(void) {
             cls[5 * plane + off] = 0.92f;
             obj[off] = 0.85f;
         }
-        /* level2(20x20, s=32) cell(5,5): l=t=1, r=b=2; cls=79 概率; obj 概率 */
+        /* level2(20x20, s=32) cell(5,5): l=t=1, r=b=2; cls=79 概率; score_sum */
         {
             float *reg = bufs[6], *cls = bufs[7], *obj = bufs[8];
             size_t plane = 400, off = 5 * 20 + 5;
@@ -963,16 +966,29 @@ int main(void) {
             cls[79 * plane + off] = 0.90f;
             obj[off] = 0.80f;
         }
+        /* level1(40x40, s=16) cell(30,30): ltrb=1; cls=0 概率 0.45, sum=0.42
+         * 官方语义 conf=0.45>0.25 保留; 旧 cls×sum 乘法 0.189<0.25 会误杀 */
+        {
+            float *reg = bufs[3], *cls = bufs[4], *obj = bufs[5];
+            size_t plane = 1600, off = 30 * 40 + 30;
+
+            reg[1 * plane + off] = 8.0f;
+            reg[17 * plane + off] = 8.0f;
+            reg[33 * plane + off] = 8.0f;
+            reg[49 * plane + off] = 8.0f;
+            cls[0 * plane + off] = 0.45f;
+            obj[off] = 0.42f;
+        }
         g_rknn_output_count = 9;
         rknn_dump_output_attrs();
         n = rknn_postprocess_outputs(outs, 9);
-        fails += check(n == 2, "decoupled: auto path decodes 2 boxes");
-        if (n >= 2) {
-            det_box_t *b0 = &g_det_boxes[0], *b1 = &g_det_boxes[1];
+        fails += check(n == 3, "decoupled: auto path decodes 3 boxes");
+        if (n >= 3) {
+            det_box_t *b0 = &g_det_boxes[0], *b1 = &g_det_boxes[1], *b2 = &g_det_boxes[2];
 
             fails += check(b0->cls == 5, "decoupled: level0 class idx");
-            fails += check(fabsf(b0->conf - 0.782f) < 0.02f,
-                           "decoupled: level0 conf = cls*obj (概率直乘)");
+            fails += check(fabsf(b0->conf - 0.92f) < 0.02f,
+                           "decoupled: level0 conf = max_cls(官方语义, sum 仅预筛)");
             fails += check(fabsf(b0->x1 - 67.8f) < 1.5f && fabsf(b0->y1 - 75.7f) < 1.5f &&
                            fabsf(b0->x2 - 108.2f) < 1.5f && fabsf(b0->y2 - 116.2f) < 1.5f,
                            "decoupled: level0 box coords(DFL)");
@@ -980,7 +996,9 @@ int main(void) {
             fails += check(fabsf(b1->x1 - 142.9f) < 1.5f && fabsf(b1->y1 - 142.9f) < 1.5f &&
                            fabsf(b1->x2 - 240.9f) < 1.5f && fabsf(b1->y2 - 240.9f) < 1.5f,
                            "decoupled: level2 box coords(DFL)");
-            /* OSD: 5 BUS / 79 TOOTHBRUSH */
+            fails += check(b2->cls == 0 && fabsf(b2->conf - 0.45f) < 0.02f,
+                           "decoupled: 中等置信度框保留(旧 cls×sum 乘法会误杀)");
+            /* OSD: 5 BUS / 79 TOOTHBRUSH / 0 PERSON */
             disp_osd_show(g_det_boxes, n);
             {
                 uint32_t lit = 0;
@@ -997,8 +1015,8 @@ int main(void) {
     }
 
     /* ---- 噪声抑制(设备实测场景): 背景原始分 ~0.09, 不得再过 0.25 阈值 ----
-     * 旧代码对已是概率的 cls/obj 再 sigmoid: 0.09 -> 0.52, 0.52*0.52 ~ 0.28
-     * 满屏噪声框; 修复后 0.09*0.09 ~ 0.008, 全部滤除 */
+     * 旧代码对已是概率的 cls/sum 再 sigmoid: 0.09 -> 0.52, 0.52*0.52 ~ 0.28
+     * 满屏噪声框; 修复后 score_sum 预筛 0.09 < 0.25 整格跳过, 全部滤除 */
     {
         rknn_output outs[9];
         float *bufs[9];
@@ -1020,7 +1038,7 @@ int main(void) {
                 g_rknn_output_attrs[idx].dims[3] = hw[lv];
             }
         }
-        /* 全图背景: cls 全部 0.09, obj 全部 0.09(设备日志反量化典型背景值) */
+        /* 全图背景: cls 全部 0.09, sum 全部 0.09(设备日志反量化典型背景值) */
         for (size_t i = 0; i < (size_t)80 * 80 * 80; i++)
             ((float *)bufs[1])[i] = 0.09f;
         for (size_t i = 0; i < (size_t)80 * 80; i++)
