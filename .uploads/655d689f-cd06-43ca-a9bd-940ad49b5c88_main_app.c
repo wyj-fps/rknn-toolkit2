@@ -1759,10 +1759,23 @@ static void rgb_nhwc_to_nchw(const uint8_t *src, uint8_t *dst,
 	}
 }
 
+/* 性能打点: 单调时钟毫秒(不受系统改时间影响) */
+static double now_ms(void) {
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
 static void *rknn_detect_thread(void *arg) {
 	(void)arg;
 	uint8_t *input_rgb = malloc(g_rknn_input_width * g_rknn_input_height * 3);
 	uint8_t *input_data = malloc(g_rknn_input_width * g_rknn_input_height * 3);
+	/* 性能统计: 滚动窗口(30 帧)各阶段累计耗时, 线程私有无需加锁 */
+	uint64_t perf_n = 0;
+	double perf_win_start = 0.0;
+	double acc_wait = 0, acc_pre = 0, acc_inf = 0, acc_out = 0, acc_post = 0,
+		   acc_osd = 0;
 
 	if (!input_rgb || !input_data) {
 		free(input_rgb);
@@ -1772,9 +1785,12 @@ static void *rknn_detect_thread(void *arg) {
 
 	while (g_rknn_detect_running) {
 		VIDEO_FRAME_INFO_S frame = {0};
+		double t0 = now_ms(), t1, t2, t3, t4, t5, t6;
 		int ret = RK_MPI_VI_GetChnFrame(0, 3, &frame, 1000);
+
 		if (ret != RK_SUCCESS)
 			continue;
+		t1 = now_ms(); /* t1-t0: 取帧等待 */
 
 		uint8_t *frame_data = RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
 		uint32_t frame_size = RK_MPI_MB_GetSize(frame.stVFrame.pMbBlk);
@@ -1787,6 +1803,7 @@ static void *rknn_detect_thread(void *arg) {
 			nv12_to_rgb(frame_data, frame.stVFrame.u32Width, frame.stVFrame.u32Height,
 						frame_stride, input_rgb, g_rknn_input_width,
 						g_rknn_input_height) == 0) {
+			t2 = now_ms(); /* t2-t1: NV12->RGB + 缩放预处理 */
 			input.index = 0;
 			input.type = RKNN_TENSOR_UINT8;
 			input.size = g_rknn_input_width * g_rknn_input_height * 3;
@@ -1801,6 +1818,7 @@ static void *rknn_detect_thread(void *arg) {
 			ret = rknn_inputs_set(g_rknn_detect_ctx, 1, &input);
 			if (ret == RKNN_SUCC)
 				ret = rknn_run(g_rknn_detect_ctx, NULL);
+			t3 = now_ms(); /* t3-t2: NCHW 转换 + 推理 */
 			if (ret == RKNN_SUCC && rknn_query(g_rknn_detect_ctx,
 											   RKNN_QUERY_IN_OUT_NUM, &io_num,
 											   sizeof(io_num)) == RKNN_SUCC) {
@@ -1808,7 +1826,10 @@ static void *rknn_detect_thread(void *arg) {
 					outputs[i].want_float = 1;
 				if (rknn_outputs_get(g_rknn_detect_ctx, io_num.n_output,
 								 outputs, NULL) == RKNN_SUCC) {
+					t4 = now_ms(); /* t4-t3: 输出拷出(含反量化) */
 					int box_cnt = rknn_postprocess_outputs(outputs, io_num.n_output);
+
+					t5 = now_ms(); /* t5-t4: 解码+NMS 后处理 */
 
 					for (int i = 0; i < box_cnt; i++) {
 						int c = g_det_boxes[i].cls;
@@ -1822,7 +1843,44 @@ static void *rknn_detect_thread(void *arg) {
 					}
 					/* 把检测框 + 类别 index/名称 叠加到 DISP 流 */
 					disp_osd_show(g_det_boxes, box_cnt);
+					t6 = now_ms(); /* t6-t5: OSD 绘制+UI 合成送显 */
 					rknn_outputs_release(g_rknn_detect_ctx, io_num.n_output, outputs);
+
+					/* ---- 性能统计: 首帧初始化窗口, 每 30 帧汇总打印一次 ---- */
+					if (perf_n == 0)
+						perf_win_start = t0;
+					acc_wait += t1 - t0;
+					acc_pre += t2 - t1;
+					acc_inf += t3 - t2;
+					acc_out += t4 - t3;
+					acc_post += t5 - t4;
+					acc_osd += t6 - t5;
+					perf_n++;
+					if (perf_n <= 3 || perf_n % 30 == 0) {
+						double win = t6 - perf_win_start;
+						double fps = win > 0.0 ? perf_n * 1000.0 / win : 0.0;
+						uint32_t fno = frame.stVFrame.u32Width,
+								 fhe = frame.stVFrame.u32Height;
+
+						printf("perf[%llu]: %stotal=%.1fms fps=%.1f "
+							   "src=%ux%u->%ux%u boxes=%d\n",
+							   (unsigned long long)perf_n,
+							   (perf_n <= 3) ? "(first) " : "",
+							   t6 - t0, fps, fno, fhe,
+							   g_rknn_input_width, g_rknn_input_height, box_cnt);
+						printf("perf[%llu]: wait=%.1f pre=%.1f inf=%.1f out=%.1f "
+							   "post=%.1f osd=%.1f (avg ms, %s)\n",
+							   (unsigned long long)perf_n,
+							   acc_wait / perf_n, acc_pre / perf_n,
+							   acc_inf / perf_n, acc_out / perf_n,
+							   acc_post / perf_n, acc_osd / perf_n,
+							   perf_n <= 3 ? "first frames" : "30f window");
+						if (perf_n % 30 == 0) { /* 窗口重置, FPS 始终反映近期状态 */
+							perf_n = 0;
+							acc_wait = acc_pre = acc_inf = 0;
+							acc_out = acc_post = acc_osd = 0;
+						}
+					}
 				}
 			}
 		}

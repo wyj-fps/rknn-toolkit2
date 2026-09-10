@@ -9,7 +9,7 @@
 #include <time.h>
 
 typedef enum { RKNN_TENSOR_NCHW = 0, RKNN_TENSOR_NHWC = 1 } rknn_tensor_format;
-typedef enum { RKNN_TENSOR_FLOAT32 = 0 } rknn_tensor_type;
+typedef enum { RKNN_TENSOR_FLOAT32 = 0, RKNN_TENSOR_UINT8 = 1 } rknn_tensor_type;
 typedef struct {
     int index;
     uint32_t n_dims;
@@ -795,6 +795,222 @@ static void osd_reset(void) {
     g_disp_osd_last_try_ms = 0;
 }
 
+/* ================== 检测线程性能打点(与 main_app.c 同步) 编译验证段 ================== */
+typedef struct {
+    uint32_t index;
+    rknn_tensor_type type;
+    rknn_tensor_format fmt;
+    uint32_t size;
+    void *buf;
+} rknn_input;
+typedef struct { uint32_t n_input; uint32_t n_output; } rknn_input_output_num;
+#define RKNN_QUERY_IN_OUT_NUM 3
+#define RKNN_SUCC 0
+/* pMbBlk 为不透明句柄(真平台语义): Handle2VirAddr/GetSize 按句柄单层解引用 */
+typedef struct { void *pMbBlk; uint32_t u32VirWidth, u32VirHeight; } MB_BLK_T;
+typedef struct {
+    uint32_t u32Width, u32Height, u32VirWidth, u32VirHeight;
+    MB_BLK_T *pMbBlk;
+} VIDEO_FRAME_ST;
+typedef struct { VIDEO_FRAME_ST stVFrame; } VIDEO_FRAME_INFO_S;
+static uint8_t g_vi_frame_buf[1280 * 720 * 3 / 2]; /* 模拟 vi 帧(NV12) */
+static MB_BLK_T g_vi_blk = { g_vi_frame_buf, 1280, 720 };
+static int g_vi_get_cnt;
+static int RK_MPI_VI_GetChnFrame(int dev, int chn, VIDEO_FRAME_INFO_S *f, int ms) {
+    (void)dev; (void)chn; (void)ms;
+    g_vi_get_cnt++;
+    memset(f, 0, sizeof(*f));
+    f->stVFrame.u32Width = 1280;
+    f->stVFrame.u32Height = 720;
+    f->stVFrame.u32VirWidth = 1280;
+    f->stVFrame.u32VirHeight = 720;
+    f->stVFrame.pMbBlk = &g_vi_blk;
+    return RK_SUCCESS;
+}
+static int RK_MPI_VI_ReleaseChnFrame(int dev, int chn, VIDEO_FRAME_INFO_S *f) {
+    (void)dev; (void)chn; (void)f;
+    return RK_SUCCESS;
+}
+static void *RK_MPI_MB_Handle2VirAddr(void *b) { return ((MB_BLK_T *)b)->pMbBlk; }
+static uint32_t RK_MPI_MB_GetSize(void *b) {
+    return ((MB_BLK_T *)b)->u32VirWidth * ((MB_BLK_T *)b)->u32VirHeight * 3 / 2;
+}
+static int rknn_query_stub(rknn_context ctx, int cmd, void *r, uint32_t len) {
+    (void)ctx; (void)len;
+    if (cmd == RKNN_QUERY_IN_OUT_NUM)
+        ((rknn_input_output_num *)r)->n_output = 9;
+    return RKNN_SUCC;
+}
+#define rknn_query rknn_query_stub
+static int rknn_inputs_set(rknn_context c, uint32_t n, const rknn_input *i) { (void)c; (void)n; (void)i; return RKNN_SUCC; }
+static int rknn_run(rknn_context c, void *e) { (void)c; (void)e; return RKNN_SUCC; }
+static int rknn_outputs_get(rknn_context c, uint32_t n, rknn_output *o, void *e) {
+    /* 共享零缓冲模拟输出(最大 64x80x80 floats): 全零 -> 无检测框, 不越界 */
+    static float out_buf[64 * 80 * 80];
+
+    (void)c; (void)e;
+    for (uint32_t i = 0; i < n && i < 16; i++) {
+        o[i].buf = out_buf;
+        o[i].size = sizeof(out_buf);
+    }
+    return RKNN_SUCC;
+}
+static int rknn_outputs_release(rknn_context c, uint32_t n, rknn_output *o) { (void)c; (void)n; (void)o; return RKNN_SUCC; }
+
+static int nv12_to_rgb_stub(const uint8_t *src, uint32_t src_width, uint32_t src_height,
+                            uint32_t src_stride, uint8_t *dst, uint32_t dst_width,
+                            uint32_t dst_height) {
+    /* 仅编译验证: 填充目标为灰度, 逻辑与 main_app.c nv12_to_rgb 一致 */
+    (void)src; (void)src_width; (void)src_height; (void)src_stride;
+    memset(dst, 114, (size_t)dst_width * dst_height * 3);
+    return 0;
+}
+#define nv12_to_rgb nv12_to_rgb_stub
+static void rgb_nhwc_to_nchw(const uint8_t *src, uint8_t *dst,
+                             uint32_t width, uint32_t height) {
+    uint32_t pixel_count = width * height;
+    uint32_t i;
+
+    for (i = 0; i < pixel_count; i++) {
+        dst[i] = src[i * 3];
+        dst[pixel_count + i] = src[i * 3 + 1];
+        dst[pixel_count * 2 + i] = src[i * 3 + 2];
+    }
+}
+
+/* 性能打点: 单调时钟毫秒(不受系统改时间影响) */
+static double now_ms(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
+
+static void *rknn_detect_thread(void *arg) {
+    (void)arg;
+    uint8_t *input_rgb = malloc(g_rknn_input_width * g_rknn_input_height * 3);
+    uint8_t *input_data = malloc(g_rknn_input_width * g_rknn_input_height * 3);
+    /* 性能统计: 滚动窗口(30 帧)各阶段累计耗时, 线程私有无需加锁 */
+    uint64_t perf_n = 0;
+    double perf_win_start = 0.0;
+    double acc_wait = 0, acc_pre = 0, acc_inf = 0, acc_out = 0, acc_post = 0,
+           acc_osd = 0;
+
+    if (!input_rgb || !input_data) {
+        free(input_rgb);
+        free(input_data);
+        return NULL;
+    }
+
+    while (g_rknn_detect_running) {
+        VIDEO_FRAME_INFO_S frame = {0};
+        double t0 = now_ms(), t1, t2, t3, t4, t5, t6;
+        int ret = RK_MPI_VI_GetChnFrame(0, 3, &frame, 1000);
+
+        if (ret != RK_SUCCESS)
+            continue;
+        t1 = now_ms(); /* t1-t0: 取帧等待 */
+
+        uint8_t *frame_data = RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
+        uint32_t frame_size = RK_MPI_MB_GetSize(frame.stVFrame.pMbBlk);
+        uint32_t frame_stride = frame.stVFrame.u32VirWidth;
+        rknn_input input = {0};
+        rknn_output outputs[16] = {0};
+        rknn_input_output_num io_num = {0};
+
+        if (frame_data && frame_size >= frame_stride * frame.stVFrame.u32VirHeight &&
+            nv12_to_rgb(frame_data, frame.stVFrame.u32Width, frame.stVFrame.u32Height,
+                        frame_stride, input_rgb, g_rknn_input_width,
+                        g_rknn_input_height) == 0) {
+            t2 = now_ms(); /* t2-t1: NV12->RGB + 缩放预处理 */
+            input.index = 0;
+            input.type = RKNN_TENSOR_UINT8;
+            input.size = g_rknn_input_width * g_rknn_input_height * 3;
+            input.fmt = g_rknn_input_format;
+            if (g_rknn_input_format == RKNN_TENSOR_NCHW)
+                rgb_nhwc_to_nchw(input_rgb, input_data, g_rknn_input_width,
+                                 g_rknn_input_height);
+            else
+                memcpy(input_data, input_rgb, input.size);
+            input.buf = input_data;
+
+            ret = rknn_inputs_set(g_rknn_detect_ctx, 1, &input);
+            if (ret == RKNN_SUCC)
+                ret = rknn_run(g_rknn_detect_ctx, NULL);
+            t3 = now_ms(); /* t3-t2: NCHW 转换 + 推理 */
+            if (ret == RKNN_SUCC && rknn_query(g_rknn_detect_ctx,
+                                               RKNN_QUERY_IN_OUT_NUM, &io_num,
+                                               sizeof(io_num)) == RKNN_SUCC) {
+                for (uint32_t i = 0; i < io_num.n_output && i < 16; i++)
+                    outputs[i].want_float = 1;
+                if (rknn_outputs_get(g_rknn_detect_ctx, io_num.n_output,
+                                 outputs, NULL) == RKNN_SUCC) {
+                    t4 = now_ms(); /* t4-t3: 输出拷出(含反量化) */
+                    int box_cnt = rknn_postprocess_outputs(outputs, io_num.n_output);
+
+                    t5 = now_ms(); /* t5-t4: 解码+NMS 后处理 */
+
+                    for (int i = 0; i < box_cnt; i++) {
+                        int c = g_det_boxes[i].cls;
+
+                        printf("det[%d/%d]: cls=%d(%s) conf=%.2f box=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                               i + 1, box_cnt, c,
+                               (c >= 0 && c < 80) ? g_coco_names[c] : "?",
+                               g_det_boxes[i].conf,
+                               g_det_boxes[i].x1, g_det_boxes[i].y1,
+                               g_det_boxes[i].x2, g_det_boxes[i].y2);
+                    }
+                    /* 把检测框 + 类别 index/名称 叠加到 DISP 流 */
+                    disp_osd_show(g_det_boxes, box_cnt);
+                    t6 = now_ms(); /* t6-t5: OSD 绘制+UI 合成送显 */
+                    rknn_outputs_release(g_rknn_detect_ctx, io_num.n_output, outputs);
+
+                    /* ---- 性能统计: 首帧初始化窗口, 每 30 帧汇总打印一次 ---- */
+                    if (perf_n == 0)
+                        perf_win_start = t0;
+                    acc_wait += t1 - t0;
+                    acc_pre += t2 - t1;
+                    acc_inf += t3 - t2;
+                    acc_out += t4 - t3;
+                    acc_post += t5 - t4;
+                    acc_osd += t6 - t5;
+                    perf_n++;
+                    if (perf_n <= 3 || perf_n % 30 == 0) {
+                        double win = t6 - perf_win_start;
+                        double fps = win > 0.0 ? perf_n * 1000.0 / win : 0.0;
+                        uint32_t fno = frame.stVFrame.u32Width,
+                                 fhe = frame.stVFrame.u32Height;
+
+                        printf("perf[%llu]: %stotal=%.1fms fps=%.1f "
+                               "src=%ux%u->%ux%u boxes=%d\n",
+                               (unsigned long long)perf_n,
+                               (perf_n <= 3) ? "(first) " : "",
+                               t6 - t0, fps, fno, fhe,
+                               g_rknn_input_width, g_rknn_input_height, box_cnt);
+                        printf("perf[%llu]: wait=%.1f pre=%.1f inf=%.1f out=%.1f "
+                               "post=%.1f osd=%.1f (avg ms, %s)\n",
+                               (unsigned long long)perf_n,
+                               acc_wait / perf_n, acc_pre / perf_n,
+                               acc_inf / perf_n, acc_out / perf_n,
+                               acc_post / perf_n, acc_osd / perf_n,
+                               perf_n <= 3 ? "first frames" : "30f window");
+                        if (perf_n % 30 == 0) { /* 窗口重置, FPS 始终反映近期状态 */
+                            perf_n = 0;
+                            acc_wait = acc_pre = acc_inf = 0;
+                            acc_out = acc_post = acc_osd = 0;
+                        }
+                    }
+                }
+            }
+        }
+        RK_MPI_VI_ReleaseChnFrame(0, 3, &frame);
+    }
+
+    free(input_rgb);
+    free(input_data);
+    return NULL;
+}
+
 int main(void) {
     int fails = 0;
     int n;
@@ -1195,6 +1411,39 @@ int main(void) {
                            "ui blend: 画布大于屏幕时按屏幕范围裁剪");
         }
 #undef BLEND_T
+    }
+
+    /* ---- 性能打点线程实跑: stub 全即时返回, 验证打印格式/统计逻辑 ---- */
+    {
+        const int chs[3] = {64, 80, 1};
+        const int hw[3] = {80, 40, 20};
+
+        g_rknn_input_width = 640;
+        g_rknn_input_height = 640;
+        g_rknn_input_format = RKNN_TENSOR_NHWC;
+        memset(g_det_boxes, 0, sizeof(g_det_boxes));
+        /* 重置为标准 9 输出解耦头结构(前面测试的 attrs 是混合残留) */
+        for (int lv = 0; lv < 3; lv++)
+            for (int k = 0; k < 3; k++) {
+                int idx = lv * 3 + k;
+
+                g_rknn_output_attrs[idx].n_dims = 4;
+                g_rknn_output_attrs[idx].fmt = RKNN_TENSOR_NCHW;
+                g_rknn_output_attrs[idx].dims[0] = 1;
+                g_rknn_output_attrs[idx].dims[1] = chs[k];
+                g_rknn_output_attrs[idx].dims[2] = hw[lv];
+                g_rknn_output_attrs[idx].dims[3] = hw[lv];
+            }
+        g_rknn_detect_running = true;
+        if (pthread_create(&g_rknn_detect_thread, NULL, rknn_detect_thread, NULL) == 0) {
+            struct timespec ts = {0, 200 * 1000 * 1000};
+
+            nanosleep(&ts, NULL);
+            g_rknn_detect_running = false;
+            pthread_join(g_rknn_detect_thread, NULL);
+        } else {
+            fails += check(0, "perf: detect thread created");
+        }
     }
 
     printf("%s\n", g_fails ? "== FAIL ==" : "== ALL PASS ==");
