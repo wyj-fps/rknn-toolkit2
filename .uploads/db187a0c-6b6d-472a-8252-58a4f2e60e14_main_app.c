@@ -1024,15 +1024,19 @@ static void rknn_dump_output_attrs(void) {
 #define DISP_OSD_RETRY_MS        1000   /* RGN 挂载失败后的重试间隔(ms) */
 
 /* 后处理选择:
- *   0: 自动 (>=3 个输出 -> yolov5 3 分支, 1 个输出 -> yolov8 单输出)
+ *   0: 自动 (>=6 个 4 维输出按空间尺寸成组 -> 解耦头; >=3 个输出 -> yolov5 3 分支;
+ *      1 个输出 -> yolov8 单输出)
  *   1: yolov5, 3 个分支输出(原始输出, 需要用 anchors 解码)
  *   2: yolov5, 单个已解码输出([1,N,5+nc], obj/cls 需 sigmoid)
  *   3: yolov8, 单个输出([1,4+nc,N], 分数已解码, 无需 sigmoid)
+ *   4: 解耦头, 每个尺度层多个输出(reg DFL 64ch + cls nc ch [+ obj 1ch]), NCHW
  * 模型输出不匹配时按 rknn_dump_output_attrs() 打印的 dims 调整。 */
 #define CVR_RKNN_POSTPROC        0
 #define DET_MAX_BOXES            32
 #define DET_CONF_THRESHOLD       0.25f
 #define DET_NMS_THRESHOLD        0.45f
+#define DFL_BINS                 16     /* 解耦头 DFL 回归 bins (4 边 x 16 = 64ch) */
+#define DECOUPLED_USE_OBJ        1     /* 解耦头 1ch 输出按 objectness 参与 conf; 无此分支置 0 */
 
 typedef struct {
 	float x1, y1, x2, y2; /* 模型输入像素坐标 */
@@ -1391,13 +1395,146 @@ static int yolo_single_decode(const float *data, const rknn_tensor_attr *attr,
 	return box_cnt;
 }
 
+/* ---------------- 解耦头后处理 (9 输出: 每层 reg DFL 64ch + cls nc ch + obj 1ch) -----
+ * 输出按空间尺寸成组(80x80/40x40/20x20, 对应 stride 8/16/32), 每组 NCHW:
+ *   reg: 1x64xHxW, DFL 分布(4 边 x 16 bins), softmax 取期望得到格子为单位的 l/t/r/b
+ *   cls: 1xncxHxW, 类别 logit(需 sigmoid)
+ *   obj: 1x1xHxW,  objectness logit(需 sigmoid, 可选)
+ * anchor 在格子中心: x1=(col+0.5-l)*stride ... (yolov6/v8 风格)
+ * ------------------------------------------------------------------------- */
+
+/* DFL: 16 个 bin 的 logit 经 softmax 后取期望值(相邻 bin 间隔 stride 个 float) */
+static float dfl_expect(const float *p, size_t stride) {
+	float e[DFL_BINS], sum = 0.0f, acc = 0.0f;
+	int i;
+
+	for (i = 0; i < DFL_BINS; i++) {
+		e[i] = expf(p[(size_t)i * stride]);
+		sum += e[i];
+	}
+	for (i = 0; i < DFL_BINS; i++)
+		acc += e[i] * (float)i;
+	return acc / (sum + 1e-9f);
+}
+
+/* 判断输出结构是否为解耦头: >=3 组同尺寸的 4 维 NCHW 输出, 每组含 64ch reg 和 nc ch cls */
+static bool rknn_is_decoupled_head(uint32_t n_out) {
+	uint32_t i = 0;
+	int groups = 0;
+
+	if (n_out < 6 || n_out > 16)
+		return false;
+	while (i < n_out) {
+		uint32_t h = g_rknn_output_attrs[i].dims[2];
+		uint32_t w = g_rknn_output_attrs[i].dims[3];
+		bool has_reg = false, has_cls = false;
+		uint32_t j = i;
+
+		if (g_rknn_output_attrs[i].n_dims != 4 ||
+			g_rknn_output_attrs[i].dims[0] != 1 ||
+			g_rknn_output_attrs[i].fmt != RKNN_TENSOR_NCHW)
+			return false;
+		while (j < n_out && g_rknn_output_attrs[j].n_dims == 4 &&
+			   g_rknn_output_attrs[j].fmt == RKNN_TENSOR_NCHW &&
+			   g_rknn_output_attrs[j].dims[2] == h &&
+			   g_rknn_output_attrs[j].dims[3] == w) {
+			uint32_t c = g_rknn_output_attrs[j].dims[1];
+
+			if (c == DFL_BINS * 4)
+				has_reg = true;
+			else if (c != 1)
+				has_cls = true;
+			j++;
+		}
+		if (!has_reg || !has_cls || j == i)
+			return false;
+		groups++;
+		i = j;
+	}
+	return groups >= 3;
+}
+
+/* 解耦头解码: 按空间尺寸分组, 组内按通道数区分 reg(64)/cls(nc)/obj(1) */
+static int yolo_decoupled_decode(const rknn_output *outputs, uint32_t n_out,
+								 int box_cnt) {
+	uint32_t i = 0;
+
+	while (i < n_out) {
+		uint32_t h = g_rknn_output_attrs[i].dims[2];
+		uint32_t w = g_rknn_output_attrs[i].dims[3];
+		uint32_t j = i, k, nc = 0;
+		const float *reg = NULL, *cls = NULL, *obj = NULL;
+		float stride_w, stride_h;
+
+		while (j < n_out && g_rknn_output_attrs[j].dims[2] == h &&
+			   g_rknn_output_attrs[j].dims[3] == w) {
+			uint32_t c = g_rknn_output_attrs[j].dims[1];
+
+			if (c == DFL_BINS * 4) {
+				reg = (const float *)outputs[j].buf;
+			} else if (c == 1) {
+				if (DECOUPLED_USE_OBJ)
+					obj = (const float *)outputs[j].buf;
+			} else {
+				cls = (const float *)outputs[j].buf;
+				nc = c;
+			}
+			j++;
+		}
+		if (!reg || !cls)
+			return box_cnt;
+		stride_w = w ? (float)g_rknn_input_width / w : 0.0f;
+		stride_h = h ? (float)g_rknn_input_height / h : 0.0f;
+		if (stride_w < 1.0f || stride_h < 1.0f)
+			return box_cnt;
+		for (uint32_t y = 0; y < h && box_cnt < DET_MAX_BOXES; y++) {
+			for (uint32_t x = 0; x < w && box_cnt < DET_MAX_BOXES; x++) {
+				size_t off = (size_t)y * w + x;
+				size_t plane = (size_t)h * w;
+				float best = 0.0f;
+				int best_cls = 0;
+
+				for (k = 0; k < nc; k++) {
+					float score = sigmoid_f(cls[(size_t)k * plane + off]);
+
+					if (score > best) {
+						best = score;
+						best_cls = (int)k;
+					}
+				}
+				if (obj)
+					best *= sigmoid_f(obj[off]);
+				if (best <= DET_CONF_THRESHOLD)
+					continue;
+				{
+					float l = dfl_expect(reg + off, plane);
+					float t = dfl_expect(reg + DFL_BINS * plane + off, plane);
+					float r = dfl_expect(reg + 2 * DFL_BINS * plane + off, plane);
+					float b = dfl_expect(reg + 3 * DFL_BINS * plane + off, plane);
+
+					g_det_boxes[box_cnt].x1 = ((float)x + 0.5f - l) * stride_w;
+					g_det_boxes[box_cnt].y1 = ((float)y + 0.5f - t) * stride_h;
+					g_det_boxes[box_cnt].x2 = ((float)x + 0.5f + r) * stride_w;
+					g_det_boxes[box_cnt].y2 = ((float)y + 0.5f + b) * stride_h;
+					g_det_boxes[box_cnt].conf = best;
+					g_det_boxes[box_cnt].cls = best_cls;
+					box_cnt++;
+				}
+			}
+		}
+		i = j;
+	}
+	return box_cnt;
+}
+
 /* 解析全部输出 -> g_det_boxes, 返回框个数 */
 static int rknn_postprocess_outputs(const rknn_output *outputs, uint32_t n_out) {
 	int mode = CVR_RKNN_POSTPROC;
 	int n = 0, i;
 
 	if (mode == 0)
-		mode = (n_out >= 3) ? 1 : 3;
+		mode = rknn_is_decoupled_head(n_out) ? 4 :
+			   (n_out >= 3 ? 1 : 3);
 
 	switch (mode) {
 	case 1:
@@ -1414,6 +1551,13 @@ static int rknn_postprocess_outputs(const rknn_output *outputs, uint32_t n_out) 
 		if (n_out >= 1)
 			n = yolo_single_decode((const float *)outputs[0].buf,
 								   &g_rknn_output_attrs[0], n, mode == 3);
+		break;
+	case 4:
+		if (rknn_is_decoupled_head(n_out))
+			n = yolo_decoupled_decode(outputs, n_out, 0);
+		else
+			printf("RKNN postproc: decoupled head structure mismatch, got %u outputs\n",
+				   n_out);
 		break;
 	}
 
@@ -1714,8 +1858,12 @@ static int rknn_stream_detect_start(const char *model_path) {
 				goto fail;
 		}
 		rknn_dump_output_attrs();
-		printf("RKNN output attributes ready, postproc=%d(auto), boxes+index will be drawn on DISP osd\n",
-			   CVR_RKNN_POSTPROC);
+		printf("RKNN output attributes ready, postproc=%d%s, boxes+index will be drawn on DISP osd\n",
+			   CVR_RKNN_POSTPROC,
+			   CVR_RKNN_POSTPROC == 0 ?
+			   (rknn_is_decoupled_head(g_rknn_output_count) ?
+				"(auto->4 decoupled DFL head)" :
+				(g_rknn_output_count >= 3 ? "(auto->1 yolov5)" : "(auto->3 yolov8)")) : "");
 	}
 
 	g_rknn_detect_running = true;
